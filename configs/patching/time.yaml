@@ -1,0 +1,5 @@
+tstride: 5
+tshape: 5
+fstride: 128
+fshape: 128
+name: time

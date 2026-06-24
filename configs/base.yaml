@@ -1,0 +1,10 @@
+defaults:
+  - data: audioset
+  - optimizer: adamW
+  - trainer: default_trainer
+  - patching: frame
+
+model: GRAM-T
+model_size: base
+save_dir: /projects/0/prjs1338
+seed: 42
