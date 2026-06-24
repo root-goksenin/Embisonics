@@ -3,6 +3,8 @@ defaults:
   - optimizer: adamW
   - trainer: default_trainer
   - patching: frame
+  - ssl: jepa 
+  - routea: ce_target
 
 model: GRAM-T
 model_size: base

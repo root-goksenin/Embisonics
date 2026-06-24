@@ -1,0 +1,9 @@
+# @package routea
+# Route A angular-distribution target (vMF mixture on a Fibonacci sphere grid).
+# Built from the IV; confidence weight w = ||<I>|| self-gates diffuse tiles
+# (no DDR threshold). fshape/tshape come from cfg.patching, NOT here, so the
+# target's patch boxes always match the tokenizer's.
+
+n_grid: 256     # sphere grid cells. ~8° spacing at 256; 512 -> ~5.7° (sharper, harder CE)
+kappa:  40.0    # vMF concentration; angular std ≈ 1/sqrt(kappa) ≈ 9° at 40.
+                # Match to grid spacing: 256→~40, 512→~80. Tune on STARSS23 val, not loss.
