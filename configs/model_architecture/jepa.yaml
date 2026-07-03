@@ -1,6 +1,3 @@
-# @package model
-# Spatial I-JEPA encoder + predictor + JEPA/grounding scalars.
-# Sizes below are the "small" config (dim=384, ~ViT-S); see presets at bottom.
 
 dim:        384      # encoder width
 enc_depth:  6        # encoder transformer blocks
@@ -10,10 +7,10 @@ pred_dim:   192      # predictor width (I-JEPA: narrower than encoder)
 pred_depth: 4        # predictor blocks
 pred_heads: 6        # predictor heads (192/6 = 32-dim heads)
 
-ema:        0.996    # target-encoder EMA momentum (raise toward 0.999+ for long runs)
+ema:        0.999    # target-encoder EMA momentum (raise toward 0.999+ for long runs)
 n_targets:  4        # I-JEPA target blocks per step
 
-lam:        1.0      # FIXED loss weight: L = L_jepa + lam * L_iv
+lam:        0.1      # FIXED loss weight: L = L_jepa + lam * L_iv
                      # NOTE: L_iv (CE over n_grid cells) starts ~ log(n_grid) ≈ 5.5,
                      # L_jepa (smooth-L1 on latents) starts < 1, so lam=1.0 is
                      # IV-heavy early. If L_jepa stalls or std_z sags in the first

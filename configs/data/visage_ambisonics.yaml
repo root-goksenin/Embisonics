@@ -1,9 +1,9 @@
-base_dir: "/projects/0/prjs1338/visage/audios/webdataset/shard-{000000..00001}.tar"
+base_dir: "/projects/0/prjs1261/visage/audios/webdataset/shard-{000000..00001}.tar"
 
 #Input specific params
 num_mel_bins: 128 
 sr: 32000
-in_channels: 7
+in_channels: 8
 input_length: 500
 target_length: 200
 

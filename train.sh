@@ -7,10 +7,10 @@
 #SBATCH --output=slurm_output_%A_%a.out
 #SBATCH --array=0
 
-cd ~/phd/Embisonics
+cd ~/embisonics_icassp/Embisonics
 
 module load 2023
 module load Anaconda3/2023.07-2
 source activate spatial-ssast-trainer
 
-python3 train_spherev2.py data=visage_ambisonics
+python3 train_new.py data=visage_ambisonics

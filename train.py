@@ -7,40 +7,49 @@ from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from src.data_modules import VisageDataModuleRAM
-from src.model import Embisonics
+from src.data_modules import ViSageDataModuleRAM        # visage_datamodule.py
+from src.model import SphereV5                          # sphere_v5.py
 from src.patching import PatchStrategy
 from utils import get_identity_from_cfg
-
 
 torch.set_float32_matmul_precision("medium")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-
-
-# Enable cuDNN benchmarking for consistent input sizes
 torch.backends.cudnn.benchmark = True
 
-@hydra.main(version_base=None, config_path="./configs", config_name="base")
+
+class RankDecorrelatedRNG(pl.Callback):
+    """Give each DDP rank its own augmentation RNG stream (see module docstring)."""
+
+    def on_fit_start(self, trainer, pl_module):
+        base = torch.initial_seed() % (2 ** 31)
+        torch.manual_seed(base + trainer.global_rank)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(base + trainer.global_rank)
+
+
+@hydra.main(version_base=None, config_path="./configs", config_name="sphere")
 def main(cfg):
+    # before model construction: reproducible weights AND masks/rotations
+    seed_everything(cfg.seed, workers=True)
+
     identity = get_identity_from_cfg(cfg)
-    log_dir = f"{cfg.save_dir}/embisonics_new" 
-    save_dir = f"{cfg.save_dir}/embisonics_saved_new/{identity.replace('_', '/')}"
-    logger = TensorBoardLogger(
-        log_dir,
-        name=identity.replace("_", "/"),
-    )
+    log_dir = f"{cfg.save_dir}/sphere_logs"
+    save_dir = f"{cfg.save_dir}/sphere/{identity.replace('_', '/')}"
+    logger = TensorBoardLogger(log_dir, name=identity.replace("_", "/"))
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_dir,
         filename="{step}",
         verbose=True,
-        every_n_train_steps=25000,
+        every_n_train_steps=cfg.trainer.ckpt_every_n_steps,
         save_last=True,
         enable_version_counter=True,
         save_top_k=-1,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
+
     trainer = pl.Trainer(
         logger=logger,
         accelerator=cfg.trainer.accelerator,
@@ -48,23 +57,40 @@ def main(cfg):
         max_steps=cfg.trainer.steps // cfg.trainer.num_gpus,
         precision=cfg.trainer.precision,
         deterministic=False,
-        callbacks=[checkpoint_callback, lr_monitor],
-        gradient_clip_val=5,
-        gradient_clip_algorithm="norm",
+        callbacks=[checkpoint_callback, lr_monitor, RankDecorrelatedRNG()],
         log_every_n_steps=1,
         num_nodes=1,
-        use_distributed_sampler=False,
+        use_distributed_sampler=False,   # InfiniteRAMDataset streams per worker
         devices=int(cfg.trainer.num_gpus),
         strategy="ddp_find_unused_parameters_true"
         if int(cfg.trainer.num_gpus) > 1
         else "auto",
     )
-    network_instance = Embisonics(
+
+    network_instance = SphereV5(
+        # ---- architecture ----
+        encoder_embedding_dim=cfg.model.encoder_embedding_dim,
+        encoder_depth=cfg.model.encoder_depth,
+        num_heads=cfg.model.num_heads,
+        mlp_ratio=cfg.model.mlp_ratio,
+        decoder_depth=cfg.model.decoder_depth,
+        decoder_num_heads=cfg.model.decoder_num_heads,
+        decoder_embedding_dim=cfg.model.decoder_embedding_dim,
+        inter_channel_heads=cfg.model.inter_channel_heads,
+        inter_channel_layers=cfg.model.inter_channel_layers,
+        gramt_model_id=cfg.model.gramt_model_id,
+        # ---- losses ----
+        q_loss_weight=cfg.loss.q,
+        diffuseness_loss_weight=cfg.loss.diffuseness,
+        leveldiff_loss_weight=cfg.loss.leveldiff,
+        level_loss_weight=cfg.loss.level,
+        # ---- optimizer ----
         lr=cfg.optimizer.lr,
-        trainer=cfg.optimizer.name,
         b1=cfg.optimizer.b1,
         b2=cfg.optimizer.b2,
         weight_decay=cfg.optimizer.weight_decay,
+        warmup_steps=cfg.optimizer.warmup_steps,
+        # ---- patching / data geometry ----
         patch_strategy=PatchStrategy(
             input_tdim=cfg.data.target_length,
             input_fdim=cfg.data.num_mel_bins,
@@ -74,23 +100,41 @@ def main(cfg):
             fshape=cfg.patching.fshape,
         ),
         in_channels=cfg.data.in_channels,
-        num_mel_bins=cfg.data.num_mel_bins,
-        target_length=cfg.data.target_length,
-        input_length=cfg.data.input_length,
-        nr_samples_per_audio=cfg.data.samples_per_audio,
         sr=cfg.data.sr,
-        compile_modules = cfg.trainer.compile_modules,
+        num_mel_bins=cfg.data.num_mel_bins,
+        input_length=cfg.data.input_length,
+        target_length=cfg.data.target_length,
+        f_max=cfg.data.f_max,
+        # ---- RouteA direction target ----
+        n_grid=cfg.route_a.n_grid,
+        vmf_kappa=cfg.route_a.vmf_kappa,
+        grid_chunk=cfg.route_a.grid_chunk,
+        # ---- coherence windows (short shared with RouteA tile) ----
+        coh_tile_t=cfg.coherence.tile_t,
+        coh_tile_f=cfg.coherence.tile_f,
+        coh_long_t=cfg.coherence.long_t,
+        coh_long_f=cfg.coherence.long_f,
+        # ---- masking ----
+        mask_ratio=cfg.masking.ratio,
+        mask_p_span=cfg.masking.p_span,
+        mask_p_random=cfg.masking.p_random,
+        mask_p_censor=cfg.masking.p_censor,
+        span_min_tokens=cfg.masking.span_min_tokens,
+        span_max_tokens=cfg.masking.span_max_tokens,
+        # ---- rotation augmentation ----
+        rotation_mode=cfg.augmentation.rotation_mode,
+        rotation_prob=cfg.augmentation.rotation_prob,
+        # ---- logging ----
+        log_every_n_steps=cfg.trainer.image_log_every_n_steps,
     )
 
-
-    data = VisageDataModuleRAM(
+    data = ViSageDataModuleRAM(
+        base_data_dir=cfg.data.glob,
         batch_size=cfg.trainer.batch_size,
-        nr_patches = network_instance.num_patches,
-        nr_samples_per_audio = cfg.data.samples_per_audio,
-        sr = cfg.data.sr,
-        rotations_per_clip=cfg.data.rotations_per_clip
+        sr=cfg.data.sr,
+        num_workers=cfg.trainer.num_workers,
     )
-    seed_everything(cfg.seed, workers=True)
+
     trainer.fit(network_instance, data)
 
 

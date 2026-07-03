@@ -2,4 +2,5 @@ lr: 0.0004
 b1 : 0.9
 b2: 0.98
 weight_decay: 0.01
+warmup_steps : 10000
 name : adamW

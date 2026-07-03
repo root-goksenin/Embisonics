@@ -1,0 +1,81 @@
+# configs/sphere_v5.yaml
+seed: 1234
+save_dir: /projects/0/prjs1338/experiments
+
+model:
+  encoder_embedding_dim: 384
+  encoder_depth: 6
+  num_heads: 12
+  mlp_ratio: 4.0
+  decoder_embedding_dim: 256
+  decoder_depth: 4
+  decoder_num_heads: 8
+  inter_channel_heads: 4
+  inter_channel_layers: 1
+  gramt_model_id: labhamlet/gramt-mono   # null -> no semantic conditioning
+
+# L = 1.0 q + 0.5 psi + 0.5 leveldiff + 0.25 level
+# (q is CE against RouteA; it starts near ln(256) ~ 5.5 and drops fast --
+#  don't rebalance off the first few hundred steps)
+loss:
+  q: 1.0
+  diffuseness: 0.5
+  leveldiff: 0.5
+  level: 0.25
+
+route_a:
+  n_grid: 256        # ~critically sampled for kappa=40
+  vmf_kappa: 40.0
+  grid_chunk: 64     # memory cap for the (B, |G|, M, T) splat
+
+coherence:           # frames x mel @ 100 fps
+  tile_t: 5          # short psi window ~50 ms, shared with the RouteA tile
+  tile_f: 3
+  long_t: 35         # long psi window ~350 ms (DRR proxy partner)
+  long_f: 3
+
+masking:
+  ratio: 0.8
+  p_span: 0.6
+  p_random: 0.2
+  p_censor: 0.2
+  span_min_tokens: 2
+  span_max_tokens: null   # null -> Nt // 4; sized for 2 s crops, raise if longer
+
+augmentation:
+  rotation_mode: so3      # so3 | yaw | null
+  rotation_prob: 1.0
+
+optimizer:
+  name: adamw
+  lr: 2.0e-4
+  b1: 0.9
+  b2: 0.95
+  weight_decay: 0.01
+  warmup_steps: 10000
+
+patching:              # must satisfy stride == shape (asserted in the model)
+  fshape: 16
+  fstride: 16
+  tshape: 8            # -> Nt = 25 time tokens on 2 s crops
+  tstride: 8
+
+data:
+  glob: /projects/0/prjs1338/visage/audios/audio/*.flac
+  sr: 32000
+  num_mel_bins: 128
+  in_channels: 7
+  input_length: 500
+  target_length: 200   # 2 s @ hop = sr // 100
+  f_max: 14000
+
+trainer:
+  accelerator: gpu
+  num_gpus: 1
+  epochs: -1
+  steps: 400000
+  batch_size: 32
+  precision: bf16-mixed
+  num_workers: 4
+  ckpt_every_n_steps: 10000
+  image_log_every_n_steps: 500
