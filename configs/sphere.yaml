@@ -1,6 +1,6 @@
 # configs/sphere_v5.yaml
 seed: 1234
-save_dir: /projects/0/prjs1338/experiments
+save_dir: /projects/0/prjs1261/experiments
 
 model:
   encoder_embedding_dim: 384
@@ -61,7 +61,7 @@ patching:              # must satisfy stride == shape (asserted in the model)
   tstride: 8
 
 data:
-  glob: /projects/0/prjs1338/visage/audios/audio/*.flac
+  glob: /projects/0/prjs1261/visage/audios/audio/*.flac
   sr: 32000
   num_mel_bins: 128
   in_channels: 7
@@ -74,7 +74,7 @@ trainer:
   num_gpus: 1
   epochs: -1
   steps: 400000
-  batch_size: 32
+  batch_size: 128
   precision: bf16-mixed
   num_workers: 4
   ckpt_every_n_steps: 10000

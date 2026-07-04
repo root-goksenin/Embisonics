@@ -5,17 +5,14 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import WandbLogger
 
 from src.data_modules import ViSageDataModuleRAM        # visage_datamodule.py
 from src.model import SphereV5                          # sphere_v5.py
 from src.patching import PatchStrategy
 from utils import get_identity_from_cfg
 
-torch.set_float32_matmul_precision("medium")
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
 
 
@@ -37,7 +34,14 @@ def main(cfg):
     identity = get_identity_from_cfg(cfg)
     log_dir = f"{cfg.save_dir}/sphere_logs"
     save_dir = f"{cfg.save_dir}/sphere/{identity.replace('_', '/')}"
-    logger = TensorBoardLogger(log_dir, name=identity.replace("_", "/"))
+    logger = WandbLogger(
+        project="ViSage",                   # set your project name
+        name=identity,
+        save_dir=log_dir,
+        config=cfg,
+        log_model=False,                    # we use ModelCheckpoint instead
+        save_code=True,                     # uploads script & git diff
+    )
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=save_dir,

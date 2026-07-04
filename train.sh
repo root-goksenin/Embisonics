@@ -13,4 +13,6 @@ module load 2023
 module load Anaconda3/2023.07-2
 source activate spatial-ssast-trainer
 
-python3 train_new.py data=visage_ambisonics
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+python3 train.py

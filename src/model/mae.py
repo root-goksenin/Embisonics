@@ -1,4 +1,5 @@
-"""SphereV5: semantically-conditioned spatial MAE for first-order Ambisonics.
+"""
+SphereV5: semantically-conditioned spatial MAE for first-order Ambisonics.
 
 Changes vs SphereV4
 -------------------
@@ -34,6 +35,11 @@ Normalization policy: ONE scalar per clip (W-channel waveform RMS), plus
 
 NOTE: checkpoints are NOT compatible with SphereV4 (decoder heads changed,
 buffers renamed).
+
+CHANGE (2024): replaced the spatial front-end (SpatialFrontEnd + inter-channel
+attention) with a plain PatchEmbed from the I-JEPA design.  This eliminates
+the inter-channel transformer, making the tokenisation purely convolutional
+and mixing channels early.  The encoder ViT blocks remain unchanged.
 """
 from typing import Optional
 from einops import rearrange
@@ -58,10 +64,14 @@ from ..patching import PatchStrategy
 from .pos_embed import get_2d_sincos_pos_embed
 from .utils import plot_fbank
 from .ambisonic_feature_extractor import FeatureExtractor
-# new modules -- adjust the relative paths to wherever you place them
+# new modules
 from .spatial_targets import RouteATarget, multiscale_diffuseness
-from .spatial_masking import MixedSpatialMaskMaker
+from ..masking import MixedSpatialMaskMaker
 from .foa_rotation import random_rotations, rotate_foa_waveform
+
+
+import io
+from PIL import Image
 
 set_fused_attn(True)
 use_fused_attn(True)
@@ -103,8 +113,6 @@ def q_ce_loss(logits: torch.Tensor, q_tgt: torch.Tensor,
 
     logits (B,P,G), q_tgt (B,P,G) rows sum to 1 (or 0 for silent patches),
     weight (B,P) -- typically log1p(Wp) * masked.
-    Returns (loss, kl_metric): CE is the trained objective (KL + const);
-    KL subtracts the target entropy and is the interpretable metric.
     """
     logp = F.log_softmax(logits.float(), dim=-1)
     ce = -(q_tgt * logp).sum(dim=-1)                       # (B,P)
@@ -117,67 +125,28 @@ def q_ce_loss(logits: torch.Tensor, q_tgt: torch.Tensor,
 
 
 # =============================================================================
-# Building blocks (unchanged from SphereV4)
+# NEW plain PatchEmbed (replaces InterChannelBlock + SpatialFrontEnd)
 # =============================================================================
 
-class InterChannelBlock(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int,
-                 num_heads: int = 4, num_layers: int = 1,
-                 mlp_ratio: float = 4.0, dropout: float = 0.0):
+class PatchEmbed(nn.Module):
+    """Plain per-patch Conv2D tokenizer, 7ch -> D. Non-overlapping (kernel==stride)
+    so no token sees a neighbour's input.  Channels are mixed from the start."""
+    def __init__(self, in_ch: int, dim: int, fshape: int, tshape: int):
         super().__init__()
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.channel_emb = nn.Parameter(torch.zeros(1, 1, in_channels, embed_dim))
-        nn.init.trunc_normal_(self.channel_emb, std=0.02)
-        layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads,
-            dim_feedforward=int(mlp_ratio * embed_dim),
-            dropout=dropout, batch_first=True, norm_first=True,
-            activation="gelu",
-        )
-        self.attn = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.proj = nn.Conv2d(in_ch, dim, kernel_size=(fshape, tshape),
+                              stride=(fshape, tshape))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, P, C, D = x.shape
-        x = x + self.channel_emb
-        x = x.view(B * P, C, D)
-        x = self.attn(x)
-        x = x.view(B, P, C, D).mean(dim=2)
-        return x
+        # x: (B, 7, F, T)   (frequency-major, as used in _encode_visible)
+        x = self.proj(x)                      # (B, D, Nf, Nt)
+        B, D, Nf, Nt = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()
+        return x.reshape(B, Nf * Nt, D)       # freq-major flat
 
 
-class SpatialFrontEnd(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int,
-                 fshape: int, tshape: int, fstride: int, tstride: int,
-                 inter_channel_heads: int = 4,
-                 inter_channel_layers: int = 1):
-        super().__init__()
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        self.proj = nn.Conv2d(
-            in_channels, in_channels * embed_dim,
-            kernel_size=(fshape, tshape),
-            stride=(fstride, tstride),
-            groups=in_channels,
-        )
-        self.inter_channel = InterChannelBlock(
-            in_channels=in_channels,
-            embed_dim=embed_dim,
-            num_heads=inter_channel_heads,
-            num_layers=inter_channel_layers,
-        )
-        self.num_patch = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
-        x = self.proj(x)
-        Nf, Nt = x.size(-2), x.size(-1)
-        x = x.view(B, self.in_channels, self.embed_dim, Nf, Nt)
-        x = x.permute(0, 3, 4, 1, 2).contiguous()
-        x = x.view(B, Nf * Nt, self.in_channels, self.embed_dim)  # p = f*Nt + t
-        x = self.inter_channel(x)
-        return x
-
+# =============================================================================
+# Decoder (unchanged)
+# =============================================================================
 
 class ConditionedDecoderBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
@@ -209,7 +178,7 @@ class ConditionedDecoderBlock(nn.Module):
 
 
 class SemanticDecoder(nn.Module):
-    """Decoder with the four SphereV5 heads (see module docstring)."""
+    """Decoder with the four SphereV5 heads."""
 
     def __init__(self, encoder_embed_dim: int, decoder_embed_dim: int,
                  depth: int, num_heads: int, patch_shape: tuple,
@@ -282,7 +251,7 @@ class SphereV5(pl.LightningModule):
             decoder_num_heads: int = 8,
             decoder_embedding_dim: int = 256,
 
-            # ---- loss weights: L = 1.0 q + 0.5 psi + 0.5 leveldiff + 0.25 level
+            # ---- loss weights ----
             q_loss_weight: float = 1.0,
             diffuseness_loss_weight: float = 0.5,
             leveldiff_loss_weight: float = 0.5,
@@ -300,8 +269,8 @@ class SphereV5(pl.LightningModule):
             input_length: int = 500,
             target_length: int = 200,     # 2 s crops @ 100 fps
 
-            inter_channel_heads: int = 4,
-            inter_channel_layers: int = 1,
+            inter_channel_heads: int = 4,          # (kept for compatibility, unused now)
+            inter_channel_layers: int = 1,         # (unused)
 
             # ---- GRAM-T mono conditioning ----
             gramt_model_id: Optional[str] = "labhamlet/gramt-mono",
@@ -311,7 +280,7 @@ class SphereV5(pl.LightningModule):
             vmf_kappa: float = 40.0,
             grid_chunk: int = 64,
 
-            # ---- coherence windows (frames, mel); short is shared with RouteA tile
+            # ---- coherence windows (frames, mel) ----
             coh_tile_t: int = 5,  coh_tile_f: int = 3,    # ~50 ms
             coh_long_t: int = 35, coh_long_f: int = 3,    # ~350 ms
             diffuseness_c: float = 1.0,   # SN3D: E=|W|^2+sum|YZX|^2 -> c=1 exact
@@ -322,15 +291,14 @@ class SphereV5(pl.LightningModule):
             mask_p_random: float = 0.2,
             mask_p_censor: float = 0.2,
             span_min_tokens: int = 2,
-            span_max_tokens: Optional[int] = None,   # default: Nt // 4
+            span_max_tokens: Optional[int] = None,
 
             # ---- rotation augmentation ----
-            rotation_mode: Optional[str] = "so3",    # "so3" | "yaw" | None
+            rotation_mode: Optional[str] = "so3",
             rotation_prob: float = 1.0,
 
             # ---- mel front end ----
-            f_max: Optional[float] = None,   # None -> sr//2; consider ~14k so the
-                                             # top mel bands aren't pure hiss
+            f_max: Optional[float] = None,
 
             log_every_n_steps: int = 500,
 
@@ -369,7 +337,6 @@ class SphereV5(pl.LightningModule):
         self.fshape, self.tshape = self.patch_strategy.fshape, self.patch_strategy.tshape
         self.patch_shape = (self.fshape, self.tshape)
 
-        # RouteA pooling / _patchify / mask grid all assume non-overlapping patches
         assert self.patch_strategy.fstride == self.fshape \
             and self.patch_strategy.tstride == self.tshape, \
             "SphereV5 requires non-overlapping patches (stride == shape)"
@@ -378,17 +345,11 @@ class SphereV5(pl.LightningModule):
         assert self.target_length == self.p_t_dim * self.tshape, \
             f"target_length {target_length} != p_t_dim*tshape {self.p_t_dim}*{self.tshape}"
 
-        # ----- Patch embed + inter-channel fusion (7 channels) ----------
-        self.patch_embed = SpatialFrontEnd(
-            in_channels=self.in_channels,
-            embed_dim=self.encoder_embedding_dim,
-            fshape=self.fshape, tshape=self.tshape,
-            fstride=self.patch_strategy.fstride,
-            tstride=self.patch_strategy.tstride,
-            inter_channel_heads=inter_channel_heads,
-            inter_channel_layers=inter_channel_layers,
-        )
-        self.patch_embed.num_patch = self.num_patches
+        # ----- Patch embed: plain Conv2D (replaces SpatialFrontEnd) -----
+        self.patch_embed = PatchEmbed(in_ch=self.in_channels,
+                                      dim=encoder_embedding_dim,
+                                      fshape=self.fshape,
+                                      tshape=self.tshape)
 
         # ----- Pos embed + CLS -----------------------------------------
         self.cls_token = nn.Parameter(
@@ -472,8 +433,6 @@ class SphereV5(pl.LightningModule):
         )
 
         # ----- Spatial targets --------------------------------------------
-        # RouteA coherence tile is unified with the SHORT diffuseness window,
-        # so w_tau = ||<I>|| = <E>(1 - psi_short) by construction.
         self.route_a = RouteATarget(
             n_grid=n_grid, kappa=vmf_kappa,
             fshape=self.fshape, tshape=self.tshape,
@@ -496,7 +455,6 @@ class SphereV5(pl.LightningModule):
             f_max=(f_max if f_max is not None else self.sr // 2),
             n_mels=self.num_mel_bins, power=2.0,
         ).float()
-        # AIV/diffuseness math assumes power spectra (|.|^2)
         assert self.melspec.power == 2.0, \
             "FeatureExtractor.power must be 2.0 for intensity/energy consistency"
 
@@ -517,11 +475,10 @@ class SphereV5(pl.LightningModule):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        for mod in [self.patch_embed, self.encoder_blocks,
-                    self.encoder_norm, self.decoder]:
+        # Apply to encoder and decoder parts (PatchEmbed is already inited by Conv)
+        for mod in [self.encoder_blocks, self.encoder_norm, self.decoder]:
             if isinstance(mod, nn.Module):
                 mod.apply(init_fn)
-        # (SphereV4 bug fixed: no dangling self.mono_proj branch)
         if self.gramt_proj is not None:
             self.gramt_proj.apply(init_fn)
 
@@ -529,7 +486,7 @@ class SphereV5(pl.LightningModule):
         if self.gram is not None:
             self.gram.eval()
 
-    # ----- Patchification (unchanged; p = f*Nt + t) ---------------------
+    # ----- Patchification (unchanged) -----
     def _patchify(self, x: torch.Tensor) -> torch.Tensor:
         fs, ts = self.fshape, self.tshape
         pf, pt = self.p_f_dim, self.p_t_dim
@@ -539,14 +496,8 @@ class SphereV5(pl.LightningModule):
         x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
         return x.reshape(B, pf * pt, C, fs, ts)
 
-    # ----- Running standardization helpers ------------------------------
+    # ----- Running standardization helpers -----
     def _ema_standardize(self, x: torch.Tensor, prefix: str) -> torch.Tensor:
-        """Standardize x with running global stats (updated only in training).
-
-        prefix='leveldiff': scalar stats over all elements of (B,P,3,fs,ts).
-        prefix='level'    : per-channel stats over (B,P) for (B,P,2).
-        Global affine transforms only -- they cannot destroy distance cues.
-        """
         mean_buf = getattr(self, f"{prefix}_running_mean")
         var_buf = getattr(self, f"{prefix}_running_var")
         inited = getattr(self, f"{prefix}_stats_inited")
@@ -574,15 +525,11 @@ class SphereV5(pl.LightningModule):
     def _extract_features(self, waveform: torch.Tensor) -> dict:
         with torch.amp.autocast('cuda', enabled=False):
             waveform = waveform.float()
-            # NORMALIZATION POLICY: exactly ONE scalar per clip (W-channel RMS),
-            # applied to all four channels.  Do NOT add per-frame / per-band /
-            # per-patch normalization anywhere in this pipeline -- it removes
-            # the level trajectories that carry distance perception.
             rms = torch.sqrt(waveform[:, :1].pow(2).mean(dim=-1, keepdim=True) + 1e-8)
             waveform = waveform / rms
             return self.melspec.extract_all(waveform)
 
-    # ----- Semantic context (GRAM-T) -------------------------------------
+    # ----- Semantic context (GRAM-T) -----
     def _mono_context(self, w_logmel: torch.Tensor) -> Optional[torch.Tensor]:
         if self.gram is None:
             return None
@@ -597,12 +544,14 @@ class SphereV5(pl.LightningModule):
         tokens = tokens + self.gramt_pos_embed
         return tokens.float()
 
-    # ----- Encoder (unchanged) --------------------------------------------
+    # ----- Encoder (adapted to new PatchEmbed) -----
     def _encode_visible(self, x_7ch: torch.Tensor,
                         visible_mask: torch.Tensor) -> torch.Tensor:
         B = x_7ch.shape[0]
+        # x_7ch: (B, 7, T, F) -> (B, 7, F, T) for freq-major patch embedding
         x = x_7ch.transpose(2, 3)
-        embedded = self.patch_strategy.embed(x, self.patch_embed)
+        # Directly call patch_embed (returns (B, P, D))
+        embedded = self.patch_embed(x)
         embedded = embedded + self.pos_embed[:, 1:, :]
 
         L_vis = visible_mask[0].sum().item()
@@ -619,17 +568,13 @@ class SphereV5(pl.LightningModule):
 
         return self.encoder_norm(x)
 
-    # ----- Batch preparation ------------------------------------------------
+    # ----- Batch preparation (unchanged) -----
     @torch.no_grad()
     def _prepare_batch(self, batch):
-        """Accepts a bare (B, 4, S) waveform tensor or a tuple whose first
-        element is one (masks and rotations are generated here, not dataset-side).
-        """
         audio = batch[0] if isinstance(batch, (tuple, list)) else batch
         audio = audio.to(self.device, non_blocking=True).float()
         N = audio.shape[0]
 
-        # --- rotation augmentation (waveform domain, exact at first order) ---
         if self.training and self.rotation_mode is not None:
             R = random_rotations(N, self.rotation_mode, device=audio.device)
             if self.rotation_prob < 1.0:
@@ -644,7 +589,6 @@ class SphereV5(pl.LightningModule):
                              feats["intensity_mel"], feats["energy_mel"]],
                             dim=1)                                # (N, 11, T, F)
 
-        # --- random time crop to target_length ---
         N_, C, T_total, n_freq = stacked.shape
         T_crop = self.target_length
         assert T_total >= T_crop, f"clip too short: {T_total} < {T_crop}"
@@ -658,10 +602,8 @@ class SphereV5(pl.LightningModule):
         fb7 = stacked[:, 0:7]
         intensity_mel = stacked[:, 7:10]
         energy_mel = stacked[:, 10:11]
-        # level-difference target in fp32 BEFORE the bf16 cast of fb7
         leveldiff = (stacked[:, 1:4] - stacked[:, 0:1]).float()  # (N,3,T,F)
 
-        # --- masks: mixed span / random / censor, exact constant count ---
         visible_mask = self.mask_maker(N).to(self.device)
 
         return (fb7.to(torch.bfloat16),
@@ -670,7 +612,7 @@ class SphereV5(pl.LightningModule):
                 leveldiff,
                 visible_mask)
 
-    # ----- Forward --------------------------------------------------------
+    # ----- Forward (unchanged) -----
     def forward(self, fb7, intensity_mel, energy_mel, leveldiff, visible_mask):
         B = fb7.shape[0]
         w_logmel = fb7[:, 0:1]
@@ -681,37 +623,30 @@ class SphereV5(pl.LightningModule):
         mono_ctx = self._mono_context(w_logmel)
         preds, cross_attn_norms = self.decoder(z_vis, visible_mask, mono_ctx)
 
-        # ---------------- targets (all fp32, no grad) ----------------
         with torch.no_grad():
-            # RouteA wants (B, 3, M, T), extractor (y,z,x) order
             q_tgt, Wp = self.route_a(
-                intensity_mel.transpose(2, 3).contiguous())        # (B,P,G),(B,P)
+                intensity_mel.transpose(2, 3).contiguous())
 
             psi = multiscale_diffuseness(
                 intensity_mel, energy_mel,
                 windows=((self.coh_tile_t, self.coh_tile_f),
                          (self.coh_long_t, self.coh_long_f)),
                 c=self.diffuseness_c,
-            )                                                       # (B,2,T,F)
-            diff_tgt = self._patchify(psi)                          # (B,P,2,fs,ts)
+            )
+            diff_tgt = self._patchify(psi)
 
             lvld_tgt = self._ema_standardize(
-                self._patchify(leveldiff).float(), "leveldiff")     # (B,P,3,fs,ts)
+                self._patchify(leveldiff).float(), "leveldiff")
 
-            Ep = self._patchify(energy_mel).float().mean(dim=(-2, -1))  # (B,P,1)
+            Ep = self._patchify(energy_mel).float().mean(dim=(-2, -1))
             lvl_raw = torch.cat([torch.log(Ep + 1e-6),
                                  torch.log1p(Wp).unsqueeze(-1)], dim=-1)
-            lvl_tgt = self._ema_standardize(lvl_raw, "level")       # (B,P,2)
+            lvl_tgt = self._ema_standardize(lvl_raw, "level")
 
             masked = ~visible_mask
-            # direction only counts where directional energy exists; log1p
-            # compression stops loud patches from dominating
             w_q = torch.log1p(Wp) * masked.float()
 
-        # ---------------- losses ----------------
         l_q, kl_q = q_ce_loss(preds["q_logits"], q_tgt, w_q)
-        # psi loss deliberately uniform (NOT Wp-weighted): reverb tails carry
-        # the DRR/distance cue and have Wp ~ 0 by construction
         l_diff = masked_l1(preds["diff"], diff_tgt, masked)
         l_leveldiff = masked_mse(preds["leveldiff"], lvld_tgt, masked)
         l_level = masked_mse_vec(preds["level"], lvl_tgt, masked)
@@ -736,23 +671,43 @@ class SphereV5(pl.LightningModule):
             "cross_attn_norms": cross_attn_norms,
         }
 
-    # ----- Metrics -----------------------------------------------------
+    # ----- Metrics (unchanged) -----
     @torch.no_grad()
     def _mean_dirs(self, q: torch.Tensor) -> torch.Tensor:
-        """(B,P,G) distribution -> (B,P,3) normalized mean direction."""
         v = q @ self.route_a.G
         return F.normalize(v, dim=-1, eps=1e-6)
 
     @torch.no_grad()
     def _q_angular_error_deg(self, q_logits, q_tgt) -> torch.Tensor:
-        """Per-patch great-circle error (deg) between mean directions, (B,P).
-        Crude for multimodal patches but a solid trend metric."""
         d_pred = self._mean_dirs(F.softmax(q_logits.float(), dim=-1))
         d_tgt = self._mean_dirs(q_tgt)
         cos = (d_pred * d_tgt).sum(dim=-1).clamp(-1.0, 1.0)
         return torch.acos(cos) * (180.0 / np.pi)
 
-    # ----- Logging helpers ----------------------------------------------
+    def _log_figure(self, fig, title: str, step: Optional[int] = None):
+        """Log a matplotlib figure as an image – compatible with WandB and TensorBoard."""
+        if step is None:
+            step = self.global_step
+
+        # Save to an in-memory PNG buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+
+        # Read back as RGB numpy array
+        img = Image.open(buf).convert('RGB')
+        img_array = np.array(img)
+
+        # Use Lightning's unified log_image (works for both WandbLogger and TensorBoardLogger)
+        if hasattr(self.logger, "log_image"):
+            self.logger.log_image(title, [img_array], step=step)
+        else:
+            # Fallback for older loggers
+            if hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "add_figure"):
+                self.logger.experiment.add_figure(title, fig, global_step=step)
+
+        plt.close(fig)
+
     def _fbank_to_patches(self, fbank: torch.Tensor) -> torch.Tensor:
         return self._patchify(fbank.float())
 
@@ -772,7 +727,7 @@ class SphereV5(pl.LightningModule):
         img = self._patches_to_img(patches)[0]
         caption = f"Loss: {loss:.4f}" if loss is not None else title
         fig = plot_fbank(img, vmin=img.min(), vmax=img.max(), title=caption)
-        self.logger.experiment.add_figure(title, fig, global_step=self.global_step)
+        self._log_figure(fig, title)
         plt.close(fig)
 
     def _add_mask_overlay(self, ax, visible_mask, scale_f=1, scale_t=1):
@@ -797,12 +752,11 @@ class SphereV5(pl.LightningModule):
         self._add_mask_overlay(ax, visible_mask)
         ax.set_title(f"{title}  (cyan = masked)")
         ax.set_xlabel("Time patch"); ax.set_ylabel("Freq patch")
-        self.logger.experiment.add_figure(title, fig, global_step=self.global_step)
+        self._log_figure(fig, title)
         plt.close(fig)
 
     def _log_diffuseness_heatmap(self, diff_pred, diff_target, visible_mask,
                                  title, channel: int = 0):
-        """L1 error heatmap for one psi channel (0=short, 1=long)."""
         with torch.no_grad():
             error = (diff_pred[:1, :, channel] - diff_target[:1, :, channel]).abs()
             error_per_patch = error.mean(dim=(-2, -1)).squeeze(0)
@@ -814,12 +768,11 @@ class SphereV5(pl.LightningModule):
         self._add_mask_overlay(ax, visible_mask)
         ax.set_title(f"{title}  (cyan = masked)")
         ax.set_xlabel("Time patch"); ax.set_ylabel("Freq patch")
-        self.logger.experiment.add_figure(title, fig, global_step=self.global_step)
+        self._log_figure(fig, title)
         plt.close(fig)
 
     def _log_leveldiff_reconstruction(self, lvld_pred, lvld_target,
                                       visible_mask, title):
-        """Target vs predicted level-difference (channel 0 = Y - W)."""
         with torch.no_grad():
             pred_ch0 = lvld_pred[:1, :, 0:1]
             tgt_ch0 = lvld_target[:1, :, 0:1]
@@ -850,7 +803,7 @@ class SphereV5(pl.LightningModule):
             fig.colorbar(im, ax=ax)
         self._add_mask_overlay(axs[2], visible_mask, scale_f=fs, scale_t=ts)
         plt.suptitle(title)
-        self.logger.experiment.add_figure(title, fig, global_step=self.global_step)
+        self._log_figure(fig, title)
         plt.close(fig)
 
     def _log_cross_attn_norms(self, cross_attn_norms, title="cross_attn_norm"):
@@ -860,10 +813,10 @@ class SphereV5(pl.LightningModule):
         ax.set_xlabel("Decoder layer"); ax.set_ylabel("Mean L2 norm")
         ax.set_title(title)
         ax.set_xticks(layers)
-        self.logger.experiment.add_figure(title, fig, global_step=self.global_step)
+        self._log_figure(fig, title)
         plt.close(fig)
 
-    # ----- Training step --------------------------------------------------
+    # ----- Training step (unchanged) -----
     def training_step(self, batch, batch_idx):
         fb7, intensity_mel, energy_mel, leveldiff, visible_mask = \
             self._prepare_batch(batch)
@@ -878,7 +831,7 @@ class SphereV5(pl.LightningModule):
             ang = self._q_angular_error_deg(out["q_logits"], out["q_tgt"])
             w = out["Wp"] * out["masked"].float()
             ang_err_masked = (ang * w).sum() / w.sum().clamp_min(1e-6)
-            psi_means = out["diff_target"].mean(dim=(0, 1, 3, 4))   # (2,)
+            psi_means = out["diff_target"].mean(dim=(0, 1, 3, 4))
 
         self.log_dict({
             "loss": loss,
@@ -925,13 +878,13 @@ class SphereV5(pl.LightningModule):
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
-    # ----- Inference / fine-tuning interface (unchanged) -----------------
+    # ----- Inference / fine-tuning interface (unchanged) -----
     def pass_through_encoder(self, x_logmel4: torch.Tensor,
                              x_iv: torch.Tensor) -> torch.Tensor:
         B = x_logmel4.shape[0]
         x_7ch = torch.cat([x_logmel4, x_iv], dim=1)
         x = x_7ch.transpose(2, 3)
-        embedded = self.patch_strategy.embed(x, self.patch_embed)
+        embedded = self.patch_embed(x)                              # (B, P, D)
         embedded = embedded + self.pos_embed[:, 1:, :]
         cls = self.cls_token.expand(B, -1, -1) + self.pos_embed[:, :1, :]
         x = torch.cat([cls, embedded], dim=1)

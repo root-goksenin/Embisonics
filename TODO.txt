@@ -1,0 +1,3 @@
+Need to do DoA probing on the simulation dataset. (SC-5h)
+Need to do Room RT60 estimation on the simulation dataset. (SC-5h)
+Need to do Distance Estimation on the simulation dataset. (SC-5h)

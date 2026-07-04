@@ -4,8 +4,8 @@ def get_identity_from_cfg(cfg):
         cfg.data.get("data_ratio"),
         cfg.optimizer.get("use_mse_loss_on_iv"),
     )
-    identity += "Model={}_ModelSize={}_".format(
-        cfg.model, cfg.model_size,
+    identity += "Model={}_".format(
+        cfg.model, 
     )
     identity += "LR={}_BatchSize={}_NrSamples={}_".format(
         cfg.optimizer.get("lr"),
