@@ -6,7 +6,7 @@ Changes vs SphereV4
 Targets / heads (decoder):
   q_head         per-patch angular distribution over a 256-cell Fibonacci
                  sphere grid (RouteATarget).  CE/KL loss weighted by
-                 log1p(Wp) * masked -- direction only where directional
+                 log1p(Wp_n) * masked -- direction only where directional
                  energy exists.  Replaces the per-bin unit-AIV dir head
                  (patch-level q + per-bin level-differences subsume it).
   diff_head      per-bin diffuseness at TWO coherence scales
@@ -16,7 +16,7 @@ Targets / heads (decoder):
   leveldiff_head per-bin logmel(Y,Z,X) - logmel(W): near-pure geometry,
                  removes the incentive to smuggle semantic content through
                  an absolute-energy head.  Standardized (running EMA), MSE.
-  level_head     two per-patch scalars: log patch energy and log1p(Wp).
+  level_head     two per-patch scalars: log patch energy and log1p(Wp_n).
                  Keeps absolute level dynamics (the other half of distance
                  perception) in the latent.  Standardized, MSE.
 
@@ -33,13 +33,42 @@ Normalization policy: ONE scalar per clip (W-channel waveform RMS), plus
   global-affine running standardizations of targets.  Nothing per-patch or
   per-frame anywhere -- that would destroy the level component of distance.
 
-NOTE: checkpoints are NOT compatible with SphereV4 (decoder heads changed,
-buffers renamed).
+CHANGE (Wp normalization): raw Wp from RouteATarget lives at O(1e5) for
+  unit-RMS clips (STFT window gain, mel filter sums, tile summation), so
+  log1p(Wp) was nearly flat across patches: silent floor ~7 vs loud source
+  ~13 -- a ~2x weight ratio instead of the intended orders of magnitude.
+  We now divide Wp by a GLOBAL running reference scale (EMA of the batch
+  arithmetic mean, tracked in log-domain) before log1p, restoring the
+  "acts only where directional energy exists, loud compressed rather than
+  dominant" semantics.  The reference is a single global constant (not
+  per-clip, not per-patch), so the absolute-level information in the
+  log1p(Wp_n) level target is preserved across clips.  Arithmetic mean
+  (not geometric) on purpose: the patch population is bimodal (silent
+  floor + directional minority) and the geometric mean would be dragged
+  toward the floor, re-flattening the weighting from the other side.
+  With this scheme a silent patch lands at Wp_n ~ 1e-3 (weight ~1e-3),
+  a typical directional patch at Wp_n ~ 1 (weight ~0.7), a very loud one
+  at Wp_n ~ 10 (weight ~2.4).
+  The ang_err_masked metric weighting was switched to the SAME log1p(Wp_n)
+  weight the loss uses (it previously used raw linear Wp, dominated by the
+  loudest few patches) -- expect a level shift in the reported metric; that
+  is a metric redefinition, not a regression.
+  New buffers wp_log_ref / wp_ref_inited; level_running_* stats must be
+  re-estimated (the level target changed non-affinely).  Checkpoints are
+  NOT strict-load compatible with previous SphereV5 runs; start fresh.
 
-CHANGE (2024): replaced the spatial front-end (SpatialFrontEnd + inter-channel
+CHANGE replaced the spatial front-end (SpatialFrontEnd + inter-channel
 attention) with a plain PatchEmbed from the I-JEPA design.  This eliminates
 the inter-channel transformer, making the tokenisation purely convolutional
 and mixing channels early.  The encoder ViT blocks remain unchanged.
+
+CHANGE (mask-aligned context): GRAM-T context tokens at MASKED positions
+are replaced by a learned null token (pos embed retained).  The decoder
+keeps the semantic prior from visible patches ("violin, it continues")
+but can no longer read masked-patch energy/decay off the mono context;
+diff/level/leveldiff gradients are re-coupled to the encoder.  Adds
+parameter gramt_null_token: old checkpoints load with strict=False
+(new param randomly initialized, everything else compatible).
 """
 from typing import Optional
 from einops import rearrange
@@ -112,7 +141,8 @@ def q_ce_loss(logits: torch.Tensor, q_tgt: torch.Tensor,
     """Weighted cross-entropy of predicted angular distribution vs RouteA q.
 
     logits (B,P,G), q_tgt (B,P,G) rows sum to 1 (or 0 for silent patches),
-    weight (B,P) -- typically log1p(Wp) * masked.
+    weight (B,P) -- typically log1p(Wp_n) * masked, with Wp_n the
+    reference-normalized directional confidence.
     """
     logp = F.log_softmax(logits.float(), dim=-1)
     ce = -(q_tgt * logp).sum(dim=-1)                       # (B,P)
@@ -467,7 +497,20 @@ class SphereV5(pl.LightningModule):
         self.register_buffer("level_stats_inited", torch.zeros(1, dtype=torch.bool))
         self.stats_momentum = 0.01
 
+        # ----- Wp reference scale (global, EMA in log-domain) ---------------
+        # Single global constant: NOT per-clip (would destroy absolute-level
+        # info in the level target) and NOT per-patch (would destroy the
+        # contrast the CE weight needs).  Tracked as log(mean(Wp)) so heavy
+        # tails don't destabilize the EMA; arithmetic mean on purpose (the
+        # patch population is bimodal, geometric mean is dragged to the
+        # silent floor).  Before initialization exp(0)=1, i.e. no rescale;
+        # the first training batch initializes it.
+        self.register_buffer("wp_log_ref", torch.zeros(1))
+        self.register_buffer("wp_ref_inited", torch.zeros(1, dtype=torch.bool))
+
         self._init_our_weights()
+        self.gramt_null_token = nn.Parameter(torch.zeros(1, 1, decoder_embedding_dim))
+        nn.init.normal_(self.gramt_null_token, std=0.02)
 
     def _init_our_weights(self):
         def init_fn(m):
@@ -522,6 +565,27 @@ class SphereV5(pl.LightningModule):
         sd = var_buf.clamp_min(1e-10).sqrt().clamp_min(1e-5)
         return (x - mean_buf) / sd
 
+    # ----- Wp reference normalization -----
+    def _normalize_wp(self, Wp: torch.Tensor) -> torch.Tensor:
+        """Divide raw Wp (B,P) by a global running reference scale.
+
+        The reference is the EMA of log(batch arithmetic mean of Wp), so the
+        rescale is a single global constant shared by all clips and patches.
+        Updated only in training; frozen (buffer) at eval/inference.
+        """
+        if self.training:
+            with torch.no_grad():
+                b = torch.log(Wp.float().mean().clamp_min(1e-6)).reshape(1)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(b, op=torch.distributed.ReduceOp.AVG)
+                if not bool(self.wp_ref_inited.any()):
+                    self.wp_log_ref.copy_(b)
+                    self.wp_ref_inited.fill_(True)
+                else:
+                    m = self.stats_momentum
+                    self.wp_log_ref.mul_(1 - m).add_(m * b)
+        return Wp / self.wp_log_ref.exp()
+
     def _extract_features(self, waveform: torch.Tensor) -> dict:
         with torch.amp.autocast('cuda', enabled=False):
             waveform = waveform.float()
@@ -530,7 +594,8 @@ class SphereV5(pl.LightningModule):
             return self.melspec.extract_all(waveform)
 
     # ----- Semantic context (GRAM-T) -----
-    def _mono_context(self, w_logmel: torch.Tensor) -> Optional[torch.Tensor]:
+    def _mono_context(self, w_logmel: torch.Tensor,
+                    visible_mask: torch.Tensor) -> Optional[torch.Tensor]:
         if self.gram is None:
             return None
         with torch.no_grad():
@@ -539,8 +604,15 @@ class SphereV5(pl.LightningModule):
         B, T_gram, FD = tokens.shape
         F_gram, D = self.gramt_n_freq, self.gramt_native_dim
         tokens = tokens.view(B, T_gram, F_gram, D).permute(0, 2, 1, 3).contiguous()
-        tokens = tokens.reshape(B, F_gram * T_gram, D)
+        tokens = tokens.reshape(B, F_gram * T_gram, D)     # freq-major, aligns with visible_mask
         tokens = self.gramt_proj(tokens)
+
+        # Replace context at masked positions with the null token,
+        # BEFORE adding pos embed so null positions still carry position.
+        vis = visible_mask.unsqueeze(-1).to(tokens.dtype)          # (B, P, 1)
+        null = self.gramt_null_token.type_as(tokens)               # (1, 1, D)
+        tokens = tokens * vis + null * (1.0 - vis)
+
         tokens = tokens + self.gramt_pos_embed
         return tokens.float()
 
@@ -568,11 +640,9 @@ class SphereV5(pl.LightningModule):
 
         return self.encoder_norm(x)
 
-    # ----- Batch preparation (unchanged) -----
     @torch.no_grad()
-    def _prepare_batch(self, batch):
+    def on_after_batch_transfer(self, batch, dataloader_idx):
         audio = batch[0] if isinstance(batch, (tuple, list)) else batch
-        audio = audio.to(self.device, non_blocking=True).float()
         N = audio.shape[0]
 
         if self.training and self.rotation_mode is not None:
@@ -612,7 +682,7 @@ class SphereV5(pl.LightningModule):
                 leveldiff,
                 visible_mask)
 
-    # ----- Forward (unchanged) -----
+    # ----- Forward -----
     def forward(self, fb7, intensity_mel, energy_mel, leveldiff, visible_mask):
         B = fb7.shape[0]
         w_logmel = fb7[:, 0:1]
@@ -620,12 +690,17 @@ class SphereV5(pl.LightningModule):
         z = self._encode_visible(fb7, visible_mask)
         z_vis = z[:, 1:, :]
 
-        mono_ctx = self._mono_context(w_logmel)
+        mono_ctx = self._mono_context(w_logmel, visible_mask)
         preds, cross_attn_norms = self.decoder(z_vis, visible_mask, mono_ctx)
 
         with torch.no_grad():
             q_tgt, Wp = self.route_a(
                 intensity_mel.transpose(2, 3).contiguous())
+
+            # Global-reference normalization of Wp BEFORE log1p: restores
+            # inter-patch contrast in the CE weight and gives the level
+            # target a well-scaled log1p component.
+            Wp_n = self._normalize_wp(Wp)
 
             psi = multiscale_diffuseness(
                 intensity_mel, energy_mel,
@@ -640,11 +715,11 @@ class SphereV5(pl.LightningModule):
 
             Ep = self._patchify(energy_mel).float().mean(dim=(-2, -1))
             lvl_raw = torch.cat([torch.log(Ep + 1e-6),
-                                 torch.log1p(Wp).unsqueeze(-1)], dim=-1)
+                                 torch.log1p(Wp_n).unsqueeze(-1)], dim=-1)
             lvl_tgt = self._ema_standardize(lvl_raw, "level")
 
             masked = ~visible_mask
-            w_q = torch.log1p(Wp) * masked.float()
+            w_q = torch.log1p(Wp_n) * masked.float()
 
         l_q, kl_q = q_ce_loss(preds["q_logits"], q_tgt, w_q)
         l_diff = masked_l1(preds["diff"], diff_tgt, masked)
@@ -662,7 +737,8 @@ class SphereV5(pl.LightningModule):
             "l_diff": l_diff,
             "l_leveldiff": l_leveldiff,
             "l_level": l_level,
-            "q_logits": preds["q_logits"], "q_tgt": q_tgt, "Wp": Wp,
+            "q_logits": preds["q_logits"], "q_tgt": q_tgt,
+            "Wp": Wp, "Wp_n": Wp_n, "w_q": w_q,
             "diff_pred": preds["diff"], "diff_target": diff_tgt,
             "leveldiff_pred": preds["leveldiff"], "leveldiff_target": lvld_tgt,
             "level_pred": preds["level"], "level_target": lvl_tgt,
@@ -683,6 +759,17 @@ class SphereV5(pl.LightningModule):
         d_tgt = self._mean_dirs(q_tgt)
         cos = (d_pred * d_tgt).sum(dim=-1).clamp(-1.0, 1.0)
         return torch.acos(cos) * (180.0 / np.pi)
+
+    @torch.no_grad()
+    def _wq_contrast(self, w_q: torch.Tensor) -> torch.Tensor:
+        """p90/p10 ratio of the positive CE weights -- direct readout of
+        whether the weighting has inter-patch contrast.  Pre-fix this was
+        ~1.5-2; post-fix it should sit around 1e2-1e3."""
+        vals = w_q[w_q > 0].float()
+        if vals.numel() < 10:
+            return torch.tensor(1.0, device=w_q.device)
+        qs = torch.quantile(vals, torch.tensor([0.1, 0.9], device=vals.device))
+        return qs[1] / qs[0].clamp_min(1e-9)
 
     def _log_figure(self, fig, title: str, step: Optional[int] = None):
         """Log a matplotlib figure as an image – compatible with WandB and TensorBoard."""
@@ -816,10 +903,9 @@ class SphereV5(pl.LightningModule):
         self._log_figure(fig, title)
         plt.close(fig)
 
-    # ----- Training step (unchanged) -----
+    # ----- Training step -----
     def training_step(self, batch, batch_idx):
-        fb7, intensity_mel, energy_mel, leveldiff, visible_mask = \
-            self._prepare_batch(batch)
+        fb7, intensity_mel, energy_mel, leveldiff, visible_mask = batch
 
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             out = self.forward(fb7, intensity_mel, energy_mel,
@@ -829,9 +915,14 @@ class SphereV5(pl.LightningModule):
 
         with torch.no_grad():
             ang = self._q_angular_error_deg(out["q_logits"], out["q_tgt"])
-            w = out["Wp"] * out["masked"].float()
+            # Metric weighting now matches the loss weighting (log1p(Wp_n)
+            # on masked patches) instead of raw linear Wp, which was
+            # dominated by the loudest few patches.  Expect a level shift
+            # vs pre-fix runs: metric redefinition, not a regression.
+            w = out["w_q"]
             ang_err_masked = (ang * w).sum() / w.sum().clamp_min(1e-6)
             psi_means = out["diff_target"].mean(dim=(0, 1, 3, 4))
+            wq_contrast = self._wq_contrast(out["w_q"])
 
         self.log_dict({
             "loss": loss,
@@ -843,6 +934,9 @@ class SphereV5(pl.LightningModule):
             "ang_err_masked_deg": ang_err_masked,
         }, prog_bar=True)
         self.log("targets/wp_mean", out["Wp"].mean())
+        self.log("targets/wp_n_mean", out["Wp_n"].mean())
+        self.log("targets/wp_log_ref", self.wp_log_ref.squeeze())
+        self.log("targets/wq_contrast_p90_p10", wq_contrast)
         self.log("targets/psi_short_mean", psi_means[0])
         self.log("targets/psi_long_mean", psi_means[1])
         for i, norm_val in enumerate(out["cross_attn_norms"]):

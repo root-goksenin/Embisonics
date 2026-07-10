@@ -1,1 +1,1 @@
-from .VisageDataModuleFromDisk import ViSageDataModuleRAM as ViSageDataModuleRAM
+from .VisageDataModule import ViSageDataModule as ViSageDataModule

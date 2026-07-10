@@ -1,59 +1,98 @@
-"""ViSage data module for SphereV5.
+"""ViSage data module for SphereV5 — disk-streaming version.
 
-Fixes vs the previous version:
-  * InfiniteRAMDataset was called as (audio_data, rotations_per_clip,
-    shuffle=True) against a (audio_tensors, shuffle) signature -> TypeError.
-  * e3nn / rotation matrices removed entirely: rotation augmentation now
-    happens on-GPU inside SphereV5._prepare_batch (waveform-domain, exact),
-    and masking also moved into the model, so the dataset yields bare
-    (4, S) audio tensors and the default collate produces (B, 4, S).
+Changes vs the RAM version:
+  * No longer loads 100k clips into memory. `setup()` only globs the file
+    list; decoding + pre-processing happen lazily inside the DataLoader
+    workers, so throughput scales with `num_workers` instead of RAM.
+  * Files are sharded across (DDP rank x dataloader worker) so no two
+    workers decode the same file in the same pass — balanced epochs and
+    no intra-batch duplicates.
+  * Each pass over a worker's shard is reshuffled with a fresh seed.
+  * Corrupt/unreadable files are skipped with a warning instead of
+    killing a multi-hour run.
 
-Requirement: pre_process_audio_visage must return equal-length clips
-(pad/truncate) or the default collate will fail.
+Requirement unchanged: pre_process_audio_visage must return equal-length
+clips (pad/truncate) or the default collate will fail.
 """
 import glob
 import random
+import warnings
 
 import torch
 import torchaudio
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
-from tqdm import tqdm
 
 from .dataset_functions import pre_process_audio_visage
 
 
-class InfiniteRAMDataset(IterableDataset):
-    """Infinite stream over pre-loaded clips; yields (4, S) audio only."""
+class InfiniteDiskDataset(IterableDataset):
+    """Infinite stream over on-disk clips; yields (4, S) audio only.
 
-    def __init__(self, audio_tensors, shuffle: bool = True):
+    Each worker owns a disjoint shard of the file list (sharded first by
+    DDP rank, then by dataloader worker id) and loops over it forever,
+    reshuffling every pass.
+    """
+
+    def __init__(self, files, sr: int, shuffle: bool = True):
         super().__init__()
-        self.audio_tensors = audio_tensors
+        self.files = files
+        self.sr = sr
         self.shuffle = shuffle
 
+    def _shard(self):
+        """Return this worker's disjoint slice of the file list."""
+        rank, world_size = 0, 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        shard_id = rank * num_workers + worker_id
+        num_shards = world_size * num_workers
+        return self.files[shard_id::num_shards]
+
+    def _load(self, path):
+        wav, original_sr = torchaudio.load(path)
+        wav = pre_process_audio_visage(wav, original_sr, self.sr)
+        if wav.shape[0] != 4:
+            raise ValueError(f"expected 4-channel FOA, got {wav.shape[0]}")
+        return wav
+
     def __iter__(self):
-        # per-worker seeding (each worker streams its own shuffled permutation;
-        # for infinite with-replacement sampling this is fine)
+        files = self._shard()
+        if not files:
+            raise RuntimeError(
+                "Empty shard: more (ranks x workers) than files. "
+                "Reduce num_workers or check the glob pattern."
+            )
+
         worker_info = get_worker_info()
         seed = torch.initial_seed() if worker_info is None \
             else torch.initial_seed() + worker_info.id
         rng = random.Random(seed)
 
-        indices = list(range(len(self.audio_tensors)))
         while True:
             if self.shuffle:
-                rng.shuffle(indices)
-            for idx in indices:
-                yield self.audio_tensors[idx]
+                rng.shuffle(files)
+            for path in files:
+                try:
+                    yield self._load(path)
+                except Exception as e:  # noqa: BLE001 — skip bad files, keep training
+                    warnings.warn(f"Skipping {path}: {e}")
 
 
-class ViSageDataModuleRAM(pl.LightningDataModule):
+class ViSageDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        base_data_dir: str = "/projects/0/prjs1338/visage/audios/audio/*.flac",
+        base_data_dir: str = "/projects/0/prjs1261/visage/audios/audio/*.flac",
         batch_size: int = 32,
         sr: int = 32000,
-        num_workers: int = 4,
+        num_workers: int = 8,   # decoding is now on the hot path; scale this up
+        prefetch_factor: int = 4,
         **kwargs,
     ):
         super().__init__()
@@ -61,33 +100,25 @@ class ViSageDataModuleRAM(pl.LightningDataModule):
         self.batch_size = batch_size
         self.sr = sr
         self.num_workers = num_workers
-        self.audio_data = []
+        self.prefetch_factor = prefetch_factor
+        self.files = []
 
     def setup(self, stage: str = None):
         if stage == "fit" or stage is None:
-            files = glob.glob(self.datapath)
-            if not files:
+            # Sort for a deterministic order -> identical sharding on every
+            # DDP rank (glob order is filesystem-dependent).
+            self.files = sorted(glob.glob(self.datapath))
+            if not self.files:
                 raise FileNotFoundError(f"No files found at {self.datapath}")
-
-            print(f"Loading {len(files)} files into RAM...")
-            loaded_data = []
-            for f in tqdm(files):
-                wav, original_sr = torchaudio.load(f)
-                wav = pre_process_audio_visage(wav, original_sr, self.sr)
-                assert wav.shape[0] == 4, \
-                    f"{f}: expected 4-channel FOA, got {wav.shape[0]}"
-                loaded_data.append(wav.cpu())
-
-            self.audio_data = loaded_data
-            print(f"Successfully loaded {len(self.audio_data)} samples into memory.")
+            print(f"Indexed {len(self.files)} files (streaming from disk).")
 
     def train_dataloader(self):
-        dataset = InfiniteRAMDataset(self.audio_data, shuffle=True)
+        dataset = InfiniteDiskDataset(self.files, sr=self.sr, shuffle=True)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
             pin_memory=True,
             num_workers=self.num_workers,
-            prefetch_factor=2,
-            persistent_workers=True,
+            prefetch_factor=self.prefetch_factor,
+            persistent_workers=self.num_workers > 0,
         )

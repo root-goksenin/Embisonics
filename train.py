@@ -7,9 +7,11 @@ from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from src.data_modules import ViSageDataModuleRAM        # visage_datamodule.py
+from src.data_modules import ViSageDataModule        # visage_datamodule.py
 from src.model import SphereV5                          # sphere_v5.py
 from src.patching import PatchStrategy
+
+from spatial_probe_callback import SpatialProbeCallback
 from utils import get_identity_from_cfg
 
 torch.set_float32_matmul_precision("high")
@@ -61,10 +63,12 @@ def main(cfg):
         max_steps=cfg.trainer.steps // cfg.trainer.num_gpus,
         precision=cfg.trainer.precision,
         deterministic=False,
-        callbacks=[checkpoint_callback, lr_monitor, RankDecorrelatedRNG()],
+        callbacks=[checkpoint_callback, 
+                   lr_monitor, 
+                   SpatialProbeCallback("/projects/0/prjs1261/probe_dataset", every_n_steps=1000)],
         log_every_n_steps=1,
         num_nodes=1,
-        use_distributed_sampler=False,   # InfiniteRAMDataset streams per worker
+        use_distributed_sampler=False,
         devices=int(cfg.trainer.num_gpus),
         strategy="ddp_find_unused_parameters_true"
         if int(cfg.trainer.num_gpus) > 1
@@ -132,7 +136,8 @@ def main(cfg):
         log_every_n_steps=cfg.trainer.image_log_every_n_steps,
     )
 
-    data = ViSageDataModuleRAM(
+
+    data = ViSageDataModule(
         base_data_dir=cfg.data.glob,
         batch_size=cfg.trainer.batch_size,
         sr=cfg.data.sr,

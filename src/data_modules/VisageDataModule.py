@@ -1,8 +1,6 @@
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 import webdataset as wds
-from e3nn import o3
-import torch
 
 from .dataset_functions import pre_process_audio_visage
 
@@ -12,33 +10,21 @@ class ViSageDataModule(pl.LightningDataModule):
         self,
         base_data_dir: str,
         batch_size: int = 32,
-        sr: int = 16000,
-        nr_samples_per_audio: int = 16,
-        nr_patches: int = 200,
-        rotations_per_clip: int = 4,
+        sr: int = 32000 ,
+        num_workers : int = 16,
         **kwargs,
     ):
         super().__init__()
         self.datapath = base_data_dir
         self.batch_size = batch_size
         self.sr = sr
-        self.nr_samples_per_audio = nr_samples_per_audio
-        self.nr_patches = nr_patches
-        self.rotations_per_clip = rotations_per_clip
+        self.num_workers = num_workers
 
     def _augment_sample(self, sample):
         audio, audio_sr = sample[0]
         audio = pre_process_audio_visage(audio, audio_sr, self.sr)
-
-        # Sample one SO(3) rotation per clip (as a 3x3 matrix).
-        # for FOA in ACN [W, Y, Z, X]
-        # the l=1 block is exactly this matrix (e3nn's real-SH basis is (y,z,x)).
-        R = torch.stack(
-            [o3.rand_matrix() for _ in range(self.rotations_per_clip)],
-            dim=0,
-        )  # (R, 3, 3)
-
-        return audio, R
+        return (audio,)
+    
     def make_web_dataset(self, path: str, shuffle: int):
         return (
             wds.WebDataset(
@@ -53,19 +39,19 @@ class ViSageDataModule(pl.LightningDataModule):
             .decode(wds.torch_audio, handler=wds.warn_and_continue)
             .to_tuple("flac")
             .map(self._augment_sample)
-            .batched(self.batch_size)
+            .batched(self.batch_size, partial=False) # batches into ([B, 4, T],)
         )
 
     def setup(self, stage: str):
         if stage == "fit":
-            self.audio_train = self.make_web_dataset(self.datapath, shuffle=1000)
+            self.audio_train = self.make_web_dataset(self.datapath, shuffle=2000)
 
     def train_dataloader(self):
         return DataLoader(
             self.audio_train,
             batch_size=None,
             pin_memory=True,
-            num_workers=2,
-            prefetch_factor=2,
+            num_workers=self.num_workers,
+            prefetch_factor=None,
             persistent_workers=True,
         )
