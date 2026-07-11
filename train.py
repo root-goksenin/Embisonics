@@ -37,7 +37,7 @@ def main(cfg):
     log_dir = f"{cfg.save_dir}/sphere_logs"
     save_dir = f"{cfg.save_dir}/sphere/{identity.replace('_', '/')}"
     logger = WandbLogger(
-        project="ViSage",                   # set your project name
+        project="ViSage", 
         name=identity,
         save_dir=log_dir,
         config=cfg,
@@ -55,7 +55,6 @@ def main(cfg):
         save_top_k=-1,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
-
     trainer = pl.Trainer(
         logger=logger,
         accelerator=cfg.trainer.accelerator,
@@ -64,7 +63,7 @@ def main(cfg):
         precision=cfg.trainer.precision,
         deterministic=False,
         callbacks=[checkpoint_callback, 
-                   lr_monitor, 
+                   lr_monitor,
                    SpatialProbeCallback("/projects/0/prjs1261/probe_dataset", every_n_steps=1000)],
         log_every_n_steps=1,
         num_nodes=1,
@@ -87,6 +86,7 @@ def main(cfg):
         inter_channel_heads=cfg.model.inter_channel_heads,
         inter_channel_layers=cfg.model.inter_channel_layers,
         gramt_model_id=cfg.model.gramt_model_id,
+        gramt_mask_context=cfg.model.gramt_mask_context,
         # ---- losses ----
         q_loss_weight=cfg.loss.q,
         diffuseness_loss_weight=cfg.loss.diffuseness,
@@ -135,7 +135,7 @@ def main(cfg):
         # ---- logging ----
         log_every_n_steps=cfg.trainer.image_log_every_n_steps,
 
-        samples_per_clip=cfg.data.samples_per_clip,
+        samples_per_clip=cfg.trainer.samples_per_clip,
         native_sr=cfg.data.native_sr
 
     )

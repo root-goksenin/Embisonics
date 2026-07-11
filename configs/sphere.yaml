@@ -13,6 +13,7 @@ model:
   inter_channel_heads: 4
   inter_channel_layers: 1
   gramt_model_id: labhamlet/gramt-mono   # null -> no semantic conditioning
+  gramt_mask_context: false
 
 # L = 1.0 q + 0.5 psi + 0.5 leveldiff + 0.25 level
 # (q is CE against RouteA; it starts near ln(256) ~ 5.5 and drops fast --
@@ -21,7 +22,7 @@ loss:
   q: 1.0
   diffuseness: 0.5
   leveldiff: 0.5
-  level: 0.25
+  level: 0.0
 
 route_a:
   n_grid: 256        # ~critically sampled for kappa=40
@@ -36,9 +37,9 @@ coherence:           # frames x mel @ 100 fps
 
 masking:
   ratio: 0.8
-  p_span: 0.6
+  p_span: 0.4
   p_random: 0.2
-  p_censor: 0.2
+  p_censor: 0.4
   span_min_tokens: 2
   span_max_tokens: null   # null -> Nt // 4; sized for 2 s crops, raise if longer
 
@@ -68,7 +69,6 @@ data:
   input_length: 500
   target_length: 200 
   f_max: 14000
-  samples_per_clip: 4
   native_sr : 48000
 
 trainer:
@@ -77,7 +77,8 @@ trainer:
   epochs: -1
   steps: 400000
   batch_size: 128
+  samples_per_clip: 2
   precision: bf16-mixed
-  num_workers: 16
+  num_workers: 8
   ckpt_every_n_steps: 10000 
   image_log_every_n_steps: 500

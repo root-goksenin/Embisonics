@@ -120,15 +120,11 @@ class SpatialProbeCallback(pl.Callback):
 
     @staticmethod
     def _ridge(Xtr, ytr, Xte, *args, k=5):
-        """
-        Non-linear probe using k-Nearest Neighbors.
-        Xtr, Xte: Embeddings (N, D)
-        ytr: Targets (N, ...)
-        """
-        # 1. Normalize embeddings to unit sphere (Cosine Similarity = L2 Distance)
+        mu, sd = Xtr.mean(0), Xtr.std(0).clamp_min(1e-6)   # restore this
+        Xtr = (Xtr - mu) / sd
+        Xte = (Xte - mu) / sd
         Xtr = F.normalize(Xtr, p=2, dim=-1)
         Xte = F.normalize(Xte, p=2, dim=-1)
-        
         sim = torch.mm(Xte.double(), Xtr.double().T)
         
         topk_sim, topk_idx = sim.topk(k, dim=-1)

@@ -1,75 +1,3 @@
-"""
-SphereV5: semantically-conditioned spatial MAE for first-order Ambisonics.
-
-Changes vs SphereV4
--------------------
-Targets / heads (decoder):
-  q_head         per-patch angular distribution over a 256-cell Fibonacci
-                 sphere grid (RouteATarget).  CE/KL loss weighted by
-                 log1p(Wp_n) * masked -- direction only where directional
-                 energy exists.  Replaces the per-bin unit-AIV dir head
-                 (patch-level q + per-bin level-differences subsume it).
-  diff_head      per-bin diffuseness at TWO coherence scales
-                 (psi_short ~50 ms, psi_long ~350 ms).  Uniform masked L1,
-                 deliberately NOT Wp-weighted: reverb tails are exactly the
-                 low-Wp patches that carry the DRR/distance cue.
-  leveldiff_head per-bin logmel(Y,Z,X) - logmel(W): near-pure geometry,
-                 removes the incentive to smuggle semantic content through
-                 an absolute-energy head.  Standardized (running EMA), MSE.
-  level_head     two per-patch scalars: log patch energy and log1p(Wp_n).
-                 Keeps absolute level dynamics (the other half of distance
-                 perception) in the latent.  Standardized, MSE.
-
-Masking: MixedSpatialMaskMaker -- 60% full-band time spans, 20% random,
-  20% right-censored (future extrapolation).  Exact constant visible count.
-
-Augmentation: random SO(3) (or yaw-only) rotation applied to the waveform
-  in _prepare_batch.  Exact at first order; W untouched, so the GRAM-T
-  context is rotation-invariant (free spatial samples under identical
-  semantic conditioning).  No time-reversal -- it corrupts the early/late
-  structure the DRR proxy needs.
-
-Normalization policy: ONE scalar per clip (W-channel waveform RMS), plus
-  global-affine running standardizations of targets.  Nothing per-patch or
-  per-frame anywhere -- that would destroy the level component of distance.
-
-CHANGE (Wp normalization): raw Wp from RouteATarget lives at O(1e5) for
-  unit-RMS clips (STFT window gain, mel filter sums, tile summation), so
-  log1p(Wp) was nearly flat across patches: silent floor ~7 vs loud source
-  ~13 -- a ~2x weight ratio instead of the intended orders of magnitude.
-  We now divide Wp by a GLOBAL running reference scale (EMA of the batch
-  arithmetic mean, tracked in log-domain) before log1p, restoring the
-  "acts only where directional energy exists, loud compressed rather than
-  dominant" semantics.  The reference is a single global constant (not
-  per-clip, not per-patch), so the absolute-level information in the
-  log1p(Wp_n) level target is preserved across clips.  Arithmetic mean
-  (not geometric) on purpose: the patch population is bimodal (silent
-  floor + directional minority) and the geometric mean would be dragged
-  toward the floor, re-flattening the weighting from the other side.
-  With this scheme a silent patch lands at Wp_n ~ 1e-3 (weight ~1e-3),
-  a typical directional patch at Wp_n ~ 1 (weight ~0.7), a very loud one
-  at Wp_n ~ 10 (weight ~2.4).
-  The ang_err_masked metric weighting was switched to the SAME log1p(Wp_n)
-  weight the loss uses (it previously used raw linear Wp, dominated by the
-  loudest few patches) -- expect a level shift in the reported metric; that
-  is a metric redefinition, not a regression.
-  New buffers wp_log_ref / wp_ref_inited; level_running_* stats must be
-  re-estimated (the level target changed non-affinely).  Checkpoints are
-  NOT strict-load compatible with previous SphereV5 runs; start fresh.
-
-CHANGE replaced the spatial front-end (SpatialFrontEnd + inter-channel
-attention) with a plain PatchEmbed from the I-JEPA design.  This eliminates
-the inter-channel transformer, making the tokenisation purely convolutional
-and mixing channels early.  The encoder ViT blocks remain unchanged.
-
-CHANGE (mask-aligned context): GRAM-T context tokens at MASKED positions
-are replaced by a learned null token (pos embed retained).  The decoder
-keeps the semantic prior from visible patches ("violin, it continues")
-but can no longer read masked-patch energy/decay off the mono context;
-diff/level/leveldiff gradients are re-coupled to the encoder.  Adds
-parameter gramt_null_token: old checkpoints load with strict=False
-(new param randomly initialized, everything else compatible).
-"""
 from typing import Optional
 from einops import rearrange
 
@@ -304,6 +232,9 @@ class SphereV5(pl.LightningModule):
 
             # ---- GRAM-T mono conditioning ----
             gramt_model_id: Optional[str] = "labhamlet/gramt-mono",
+            gramt_mask_context: bool = True,   # ABLATION: False = decoder sees
+                                               # full-clip mono context at all
+                                               # positions (no null token)
 
             # ---- RouteA direction target ----
             n_grid: int = 256,
@@ -360,6 +291,7 @@ class SphereV5(pl.LightningModule):
         self.diffuseness_c = diffuseness_c
         self.rotation_mode = rotation_mode
         self.rotation_prob = rotation_prob
+        self.gramt_mask_context = gramt_mask_context
         self.log_every_n_steps = log_every_n_steps
         self.encoder_embedding_dim = encoder_embedding_dim
 
@@ -452,6 +384,16 @@ class SphereV5(pl.LightningModule):
                 torch.from_numpy(pe_ctx).float().unsqueeze(0)
             )
 
+            # Null token only exists in the mask-aligned arm.  Created
+            # conditionally (not created-and-ignored) so DDP with
+            # find_unused_parameters=False stays happy and the ablation arm
+            # is honest about its parameter set.  Cross-arm checkpoint
+            # loading: strict=False (state_dicts differ by this one key).
+            if gramt_mask_context:
+                self.gramt_null_token = nn.Parameter(
+                    torch.zeros(1, 1, decoder_embedding_dim))
+                nn.init.normal_(self.gramt_null_token, std=0.02)
+
         # ----- Decoder ----------------------------------------------------
         self.decoder = SemanticDecoder(
             encoder_embed_dim=self.encoder_embedding_dim,
@@ -512,8 +454,6 @@ class SphereV5(pl.LightningModule):
         self.register_buffer("wp_ref_inited", torch.zeros(1, dtype=torch.bool))
 
         self._init_our_weights()
-        self.gramt_null_token = nn.Parameter(torch.zeros(1, 1, decoder_embedding_dim))
-        nn.init.normal_(self.gramt_null_token, std=0.02)
 
         self.samples_per_clip = samples_per_clip
         self.native_sr = native_sr if native_sr is not None else sr
@@ -626,11 +566,14 @@ class SphereV5(pl.LightningModule):
         tokens = tokens.reshape(B, F_gram * T_gram, D)     # freq-major, aligns with visible_mask
         tokens = self.gramt_proj(tokens)
 
-        # Replace context at masked positions with the null token,
-        # BEFORE adding pos embed so null positions still carry position.
-        vis = visible_mask.unsqueeze(-1).to(tokens.dtype)          # (B, P, 1)
-        null = self.gramt_null_token.type_as(tokens)               # (1, 1, D)
-        tokens = tokens * vis + null * (1.0 - vis)
+        if self.gramt_mask_context:
+            # Mask-aligned arm: replace context at masked positions with the
+            # null token, BEFORE adding pos embed so null positions still
+            # carry position.  Ablation arm (False): tokens pass through
+            # unmasked -- decoder sees full-clip mono context everywhere.
+            vis = visible_mask.unsqueeze(-1).to(tokens.dtype)      # (B, P, 1)
+            null = self.gramt_null_token.type_as(tokens)           # (1, 1, D)
+            tokens = tokens * vis + null * (1.0 - vis)
 
         tokens = tokens + self.gramt_pos_embed
         return tokens.float()
@@ -1029,4 +972,5 @@ class SphereV5(pl.LightningModule):
             f = self.grid_size[0]
             return rearrange(z[:, 1:, :], "b (f t) d -> b t (f d)",
                              f=f, d=self.encoder_embedding_dim)
+
         raise ValueError(f"Unknown strategy '{strategy}'")
