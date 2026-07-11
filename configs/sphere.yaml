@@ -66,8 +66,10 @@ data:
   num_mel_bins: 128
   in_channels: 7
   input_length: 500
-  target_length: 200   # 2 s @ hop = sr // 100
+  target_length: 200 
   f_max: 14000
+  samples_per_clip: 4
+  native_sr : 48000
 
 trainer:
   accelerator: gpu

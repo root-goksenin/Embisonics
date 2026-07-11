@@ -136,7 +136,7 @@ def main(cfg):
         log_every_n_steps=cfg.trainer.image_log_every_n_steps,
 
         samples_per_clip=cfg.data.samples_per_clip,
-        data_sr=cfg.data.data_sr
+        native_sr=cfg.data.native_sr
 
     )
 
@@ -146,6 +146,7 @@ def main(cfg):
         batch_size=cfg.trainer.batch_size,
         sr=cfg.data.sr,
         num_workers=cfg.trainer.num_workers,
+        native_sr=cfg.data.native_sr
     )
 
     trainer.fit(network_instance, data)

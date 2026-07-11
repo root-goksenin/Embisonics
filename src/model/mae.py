@@ -333,7 +333,7 @@ class SphereV5(pl.LightningModule):
             log_every_n_steps: int = 500,
 
             samples_per_clip: int = 4,
-            data_sr: Optional[int] = None,   # native sr of shards; None = already self.sr
+            native_sr: Optional[int] = None,   # native sr of shards; None = already self.sr
 
             **kwargs,
         ):
@@ -516,7 +516,7 @@ class SphereV5(pl.LightningModule):
         nn.init.normal_(self.gramt_null_token, std=0.02)
 
         self.samples_per_clip = samples_per_clip
-        self.data_sr = data_sr if data_sr is not None else sr
+        self.native_sr = native_sr if native_sr is not None else sr
         self._gpu_resampler = None       # lazy; built on first batch, on-device
 
     def _init_our_weights(self):
@@ -535,12 +535,12 @@ class SphereV5(pl.LightningModule):
     def _maybe_resample(self, audio: torch.Tensor) -> torch.Tensor:
         """GPU resample native-sr waveforms to self.sr. Kernel is built once
         and cached; conv1d on GPU, negligible cost vs the mel front end."""
-        if self.data_sr == self.sr:
+        if self.native_sr == self.sr:
             return audio
         if self._gpu_resampler is None:
             import torchaudio
             self._gpu_resampler = torchaudio.transforms.Resample(
-                self.data_sr, self.sr, lowpass_filter_width=64,
+                self.native_sr, self.sr, lowpass_filter_width=64,
             ).to(audio.device).float()
         return self._gpu_resampler(audio.float())
 
