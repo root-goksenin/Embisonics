@@ -134,6 +134,10 @@ def main(cfg):
         rotation_prob=cfg.augmentation.rotation_prob,
         # ---- logging ----
         log_every_n_steps=cfg.trainer.image_log_every_n_steps,
+
+        samples_per_clip=cfg.data.samples_per_clip,
+        data_sr=cfg.data.data_sr
+
     )
 
 

@@ -332,6 +332,9 @@ class SphereV5(pl.LightningModule):
 
             log_every_n_steps: int = 500,
 
+            samples_per_clip: int = 4,
+            data_sr: Optional[int] = None,   # native sr of shards; None = already self.sr
+
             **kwargs,
         ):
         super().__init__()
@@ -512,6 +515,10 @@ class SphereV5(pl.LightningModule):
         self.gramt_null_token = nn.Parameter(torch.zeros(1, 1, decoder_embedding_dim))
         nn.init.normal_(self.gramt_null_token, std=0.02)
 
+        self.samples_per_clip = samples_per_clip
+        self.data_sr = data_sr if data_sr is not None else sr
+        self._gpu_resampler = None       # lazy; built on first batch, on-device
+
     def _init_our_weights(self):
         def init_fn(m):
             if isinstance(m, nn.Linear):
@@ -524,6 +531,18 @@ class SphereV5(pl.LightningModule):
                 mod.apply(init_fn)
         if self.gramt_proj is not None:
             self.gramt_proj.apply(init_fn)
+
+    def _maybe_resample(self, audio: torch.Tensor) -> torch.Tensor:
+        """GPU resample native-sr waveforms to self.sr. Kernel is built once
+        and cached; conv1d on GPU, negligible cost vs the mel front end."""
+        if self.data_sr == self.sr:
+            return audio
+        if self._gpu_resampler is None:
+            import torchaudio
+            self._gpu_resampler = torchaudio.transforms.Resample(
+                self.data_sr, self.sr, lowpass_filter_width=64,
+            ).to(audio.device).float()
+        return self._gpu_resampler(audio.float())
 
     def on_fit_start(self):
         if self.gram is not None:
@@ -643,8 +662,12 @@ class SphereV5(pl.LightningModule):
     @torch.no_grad()
     def on_after_batch_transfer(self, batch, dataloader_idx):
         audio = batch[0] if isinstance(batch, (tuple, list)) else batch
+
+        # 0. GPU resample (was CPU, per-sample, in the datamodule)
+        audio = self._maybe_resample(audio)
         N = audio.shape[0]
 
+        # 1. Rotation aug — per clip, on the waveform (must precede features)
         if self.training and self.rotation_mode is not None:
             R = random_rotations(N, self.rotation_mode, device=audio.device)
             if self.rotation_prob < 1.0:
@@ -654,27 +677,36 @@ class SphereV5(pl.LightningModule):
                 R = torch.where(keep, R, eye)
             audio = rotate_foa_waveform(audio, R)
 
+        # 2. Features ONCE per clip (per-clip W-RMS norm lives inside)
         feats = self._extract_features(audio)
         stacked = torch.cat([feats["logmel"], feats["aiv"],
-                             feats["intensity_mel"], feats["energy_mel"]],
-                            dim=1)                                # (N, 11, T, F)
+                            feats["intensity_mel"], feats["energy_mel"]],
+                            dim=1)                          # (N, 11, T_total, F)
 
+        # 3. Multi-crop: S random 2 s windows per clip, gathered in one shot
+        S = self.samples_per_clip if self.training else 1
         N_, C, T_total, n_freq = stacked.shape
         T_crop = self.target_length
         assert T_total >= T_crop, f"clip too short: {T_total} < {T_crop}"
-        max_start = T_total - T_crop
-        offsets = torch.randint(0, max_start + 1, (N,), device=self.device)
-        t_range = torch.arange(T_crop, device=self.device)
-        time_idx = (offsets.view(N, 1, 1, 1) + t_range.view(1, 1, T_crop, 1)) \
-            .expand(N, C, T_crop, n_freq)
-        stacked = torch.gather(stacked, dim=2, index=time_idx)
 
+        starts = torch.randint(0, T_total - T_crop + 1, (N, S),
+                            device=self.device)          # (N, S)
+        t_range = torch.arange(T_crop, device=self.device)
+        # (N, S, C, T_crop, F) gather indices along the time dim
+        time_idx = (starts.view(N, S, 1, 1, 1) + t_range.view(1, 1, 1, T_crop, 1)) \
+            .expand(N, S, C, T_crop, n_freq)
+        stacked = torch.gather(
+            stacked.unsqueeze(1).expand(N, S, C, T_total, n_freq),
+            dim=3, index=time_idx,
+        ).reshape(N * S, C, T_crop, n_freq)                 # (N*S, 11, T_crop, F)
+
+        # 4. Split channels + targets (unchanged, just on N*S rows)
         fb7 = stacked[:, 0:7]
         intensity_mel = stacked[:, 7:10]
         energy_mel = stacked[:, 10:11]
-        leveldiff = (stacked[:, 1:4] - stacked[:, 0:1]).float()  # (N,3,T,F)
+        leveldiff = (stacked[:, 1:4] - stacked[:, 0:1]).float()
 
-        visible_mask = self.mask_maker(N).to(self.device)
+        visible_mask = self.mask_maker(N * S).to(self.device)
 
         return (fb7.to(torch.bfloat16),
                 intensity_mel.float(),
