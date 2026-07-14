@@ -149,7 +149,7 @@ def main(cfg):
         native_sr=cfg.data.native_sr
     )
 
-    trainer.fit(network_instance, data)
+    trainer.fit(network_instance, data, ckpt_path=cfg.model.get("pretrained_ckpt", None))
 
 
 if __name__ == "__main__":

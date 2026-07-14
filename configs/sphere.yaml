@@ -14,14 +14,12 @@ model:
   inter_channel_layers: 1
   gramt_model_id: labhamlet/gramt-mono   # null -> no semantic conditioning
   gramt_mask_context: false
+  pretrained_ckpt: /projects/0/prjs1261/experiments/model/step=80000.ckpt
 
-# L = 1.0 q + 0.5 psi + 0.5 leveldiff + 0.25 level
-# (q is CE against RouteA; it starts near ln(256) ~ 5.5 and drops fast --
-#  don't rebalance off the first few hundred steps)
 loss:
   q: 1.0
-  diffuseness: 0.5
-  leveldiff: 0.5
+  diffuseness: 0.0
+  leveldiff: 0.0
   level: 0.0
 
 route_a:
@@ -79,6 +77,6 @@ trainer:
   batch_size: 128
   samples_per_clip: 2
   precision: bf16-mixed
-  num_workers: 8
+  num_workers: 16
   ckpt_every_n_steps: 10000 
   image_log_every_n_steps: 500

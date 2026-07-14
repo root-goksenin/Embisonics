@@ -30,6 +30,9 @@ from .foa_rotation import random_rotations, rotate_foa_waveform
 import io
 from PIL import Image
 
+import psutil
+import os
+
 set_fused_attn(True)
 use_fused_attn(True)
 
@@ -457,8 +460,15 @@ class SphereV5(pl.LightningModule):
 
         self.samples_per_clip = samples_per_clip
         self.native_sr = native_sr if native_sr is not None else sr
-        self._gpu_resampler = None       # lazy; built on first batch, on-device
+        self._resampler_holder = []   # plain list -> not tracked by nn.Module
 
+
+    def on_load_checkpoint(self, checkpoint):
+        sd = checkpoint.get("state_dict", checkpoint)
+        for k in list(sd):
+            if k.startswith("_gpu_resampler"):
+                sd.pop(k)
+                
     def _init_our_weights(self):
         def init_fn(m):
             if isinstance(m, nn.Linear):
@@ -472,17 +482,17 @@ class SphereV5(pl.LightningModule):
         if self.gramt_proj is not None:
             self.gramt_proj.apply(init_fn)
 
+
     def _maybe_resample(self, audio: torch.Tensor) -> torch.Tensor:
-        """GPU resample native-sr waveforms to self.sr. Kernel is built once
-        and cached; conv1d on GPU, negligible cost vs the mel front end."""
         if self.native_sr == self.sr:
             return audio
-        if self._gpu_resampler is None:
+        if not self._resampler_holder:
             import torchaudio
-            self._gpu_resampler = torchaudio.transforms.Resample(
+            rs = torchaudio.transforms.Resample(
                 self.native_sr, self.sr, lowpass_filter_width=64,
             ).to(audio.device).float()
-        return self._gpu_resampler(audio.float())
+            self._resampler_holder.append(rs)
+        return self._resampler_holder[0](audio.float())
 
     def on_fit_start(self):
         if self.gram is not None:
@@ -747,28 +757,34 @@ class SphereV5(pl.LightningModule):
         return qs[1] / qs[0].clamp_min(1e-9)
 
     def _log_figure(self, fig, title: str, step: Optional[int] = None):
-        """Log a matplotlib figure as an image – compatible with WandB and TensorBoard."""
-        if step is None:
-            step = self.global_step
+            """Log a matplotlib figure as an image – compatible with WandB and TensorBoard."""
+            if step is None:
+                step = self.global_step
 
-        # Save to an in-memory PNG buffer
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
+            # Save to an in-memory PNG buffer
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight')
+            buf.seek(0)
 
-        # Read back as RGB numpy array
-        img = Image.open(buf).convert('RGB')
-        img_array = np.array(img)
+            # Read back as RGB numpy array using a context manager to guarantee closure
+            with Image.open(buf) as img:
+                img_rgb = img.convert('RGB')
+                img_array = np.array(img_rgb)
+                img_rgb.close() # Close the converted image
+                
+            buf.close() # Close the IO buffer
 
-        # Use Lightning's unified log_image (works for both WandbLogger and TensorBoardLogger)
-        if hasattr(self.logger, "log_image"):
-            self.logger.log_image(title, [img_array], step=step)
-        else:
-            # Fallback for older loggers
-            if hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "add_figure"):
-                self.logger.experiment.add_figure(title, fig, global_step=step)
+            # Use Lightning's unified log_image (works for both WandbLogger and TensorBoardLogger)
+            if hasattr(self.logger, "log_image"):
+                self.logger.log_image(title, [img_array], step=step)
+            else:
+                # Fallback for older loggers
+                if hasattr(self.logger, "experiment") and hasattr(self.logger.experiment, "add_figure"):
+                    self.logger.experiment.add_figure(title, fig, global_step=step)
 
-        plt.close(fig)
+            # Completely clear axes/colorbars to break cyclic references before closing
+            fig.clf()
+            plt.close(fig)
 
     def _fbank_to_patches(self, fbank: torch.Tensor) -> torch.Tensor:
         return self._patchify(fbank.float())
@@ -896,8 +912,15 @@ class SphereV5(pl.LightningModule):
             # vs pre-fix runs: metric redefinition, not a regression.
             w = out["w_q"]
             ang_err_masked = (ang * w).sum() / w.sum().clamp_min(1e-6)
-            psi_means = out["diff_target"].mean(dim=(0, 1, 3, 4))
-            wq_contrast = self._wq_contrast(out["w_q"])
+
+
+        sys_mem = psutil.virtual_memory()
+        system_ram_gb = sys_mem.used / (1024 ** 3)
+        system_ram_percent = sys_mem.percent
+
+        # Get specific RAM used by THIS python process
+        process = psutil.Process(os.getpid())
+        process_ram_gb = process.memory_info().rss / (1024 ** 3)
 
         self.log_dict({
             "loss": loss,
@@ -907,13 +930,11 @@ class SphereV5(pl.LightningModule):
             "l_leveldiff": out["l_leveldiff"],
             "l_level": out["l_level"],
             "ang_err_masked_deg": ang_err_masked,
+            "system/system_ram_gb": system_ram_gb,         # Total node RAM
+            "system/system_ram_percent": system_ram_percent, 
+            "system/process_ram_gb": process_ram_gb,       # Main process RAM
         }, prog_bar=True)
-        self.log("targets/wp_mean", out["Wp"].mean())
-        self.log("targets/wp_n_mean", out["Wp_n"].mean())
-        self.log("targets/wp_log_ref", self.wp_log_ref.squeeze())
-        self.log("targets/wq_contrast_p90_p10", wq_contrast)
-        self.log("targets/psi_short_mean", psi_means[0])
-        self.log("targets/psi_long_mean", psi_means[1])
+
         for i, norm_val in enumerate(out["cross_attn_norms"]):
             self.log(f"cross_attn_norm/layer_{i}", norm_val)
 

@@ -3,7 +3,7 @@
 #SBATCH --gpus=1
 #SBATCH --job-name=GRAMTi
 #SBATCH --ntasks=1
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=slurm_output_%A_%a.out
 #SBATCH --array=0
 #SBATCH --constraint=scratch-node

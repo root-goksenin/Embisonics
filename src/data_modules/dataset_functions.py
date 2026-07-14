@@ -106,23 +106,22 @@ def instance_normalize(feature: torch.Tensor) -> torch.Tensor:
     return (feature - feature.mean()) / (feature.std() + 1e-8)
 
 
-def pre_process_audio_visage(waveform, audio_sr, resample_sr):
+def pre_process_audio_visage(waveform, audio_sr, native_sr):
     # waveform: (4, T) — ambisonics channels [W, Y, Z, X] with SN3D
-    waveform = (
-        torchaudio.functional.resample(waveform, audio_sr, resample_sr)
-        if audio_sr != resample_sr
-        else waveform
-    )
-    # Ensure 4 channels
+    # NO resampling here anymore — done on GPU in on_after_batch_transfer.
+    # We only enforce layout and a uniform length so default collate can stack.
     assert waveform.shape[0] == 4, f"Expected 4 channels, got {waveform.shape[0]}"
-    # Make sure audio is 5 seconds
-    target_len = resample_sr * 5
+    assert audio_sr == native_sr, (
+        f"Shard sample rate {audio_sr} != expected native rate {native_sr}; "
+        "GPU resampler is built for a single fixed orig_sr — re-shard or bucket."
+    )
+    target_len = native_sr * 5              # 5 s at NATIVE rate
     padding = target_len - waveform.shape[1]
     if padding > 0:
         waveform = F.pad(waveform, (0, padding), "constant", 0)
     elif padding < 0:
         waveform = waveform[:, :target_len]
-    return waveform  # (4, resample_sr * 5)
+    return waveform  # (4, native_sr * 5)
 
 
 
